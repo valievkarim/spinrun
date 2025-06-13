@@ -1,0 +1,415 @@
+#!/bin/bash
+set -o nounset -o errexit -o pipefail
+[ "${XTRACE:-0}" = "1" ] && set -o xtrace
+
+print_help() {
+cat <<EOF
+Usage:
+  spinrun [--target x86|arm] [--qemu-args <args> --] [<command> [<args...>]]
+  spinrun [--target x86|arm] [--qemu-args <args> --] "<shell-command>"
+
+Runs commands in a clean, disposable Linux VM.
+Each run starts from scratch — no state is preserved.
+
+Default target is the native host architecture.
+
+Options:
+  --target <x86|arm>     Select target architecture
+  --qemu-args <args>     Start a list of arguments passed directly to QEMU; must be closed with \`--\`
+                         Example: --qemu-args -m 512 -smp 2 --
+
+You can also invoke as:
+  spinrun-x86            Shortcut for --target x86
+  spinrun-arm            Shortcut for --target arm
+
+Examples:
+  spinrun                                  # Start interactive shell (native target)
+  spinrun --target arm uname -a            # Run command on ARM guest
+  spinrun --qemu-args -m 8G -- free -m     # Start command with extra QEMU args
+  spinrun "echo hello && whoami"           # Run shell command
+  spinrun-x86 ping 8.8.8.8                 # Shortcut for x86 target
+  XTRACE=1 spinrun ls -la /                # Enable full debug tracing
+
+  # Share current directory with guest:
+  spinrun --qemu-args -virtfs local,path=./,mount_tag=share,security_model=none --
+  # In guest:
+  mount -t 9p share /mnt
+
+  # Install packages inside (Alpine guest):
+  apk add htop
+  apk add bash coreutils                 # Useful shell tools
+  apk add build-base                 # gcc, make, etc.
+
+  # Use podman inside guest:
+  apk add podman                         # Install podman
+  podman run --rm -it ubuntu bash        # Drop into Ubuntu shell inside container
+EOF
+
+if [[ -e /dev/kvm && ! -r /dev/kvm ]]; then
+    echo
+    echo "/dev/kvm exists but is not accessible."
+    if [[ $EUID -ne 0 ]]; then
+        echo "To enable KVM acceleration, run as root or add your user to the 'kvm' group:"
+        echo "  sudo usermod -aG kvm \$USER"
+        echo "Then log out and back in, or start a new terminal session."
+    fi
+fi
+}
+
+
+debug() { :; }
+error() { echo "[ERROR] $*" >&2 || true; }
+
+trap 'debug "got sigint in spinrun"; trap - INT; kill -s INT "$$"' INT
+
+for cmd in qemu-system-aarch64 qemu-system-x86_64 sed uname mktemp tty; do
+    command -v "$cmd" >/dev/null || { error "command $cmd not found" ; exit 1; }
+done
+
+QEMU_VERSION="$(qemu-system-aarch64 --version | sed -n 1p)"
+
+version=${QEMU_VERSION#*version }  # e.g. "9.2.2"
+major=${version%%.*}               # strip after first dot → "9"
+minor_tmp=${version#*.}            # strip before first dot → "2.2"
+minor=${minor_tmp%%.*}             # strip after next dot → "2"
+
+if ! (( major > 8 || (major == 8 && minor >= 1) )); then
+    error "QEMU version too old, need at least v8.1.0: '$QEMU_VERSION'"
+    exit 1
+fi
+
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOST_ARCH="$(uname -m|sed 's/arm64/aarch64/')"
+HOST_OS="$(uname)"
+
+QEMU_ARGS_USER=()
+TARGET=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --target)
+            if [ -z "${2:-}" ]; then
+                error "--target requires argument"
+                exit 1
+            fi
+            TARGET="$2"
+            shift 2
+            ;;
+        --qemu-args)
+            shift
+            while [[ $# -gt 0 && "$1" != "--" ]]; do
+                QEMU_ARGS_USER+=("$1")
+                shift
+            done
+            if [[ "${1:-}" == "--" ]]; then
+                shift
+            fi
+            ;;
+        --help|-h)
+            print_help
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+CMD_ARGS=("$@")
+
+# If no target specified, check script name or use native arch
+if [ -z "$TARGET" ]; then
+    case "$0" in
+        *-arm)
+            TARGET="arm"
+            ;;
+        *-x86)
+            TARGET="x86"
+            ;;
+        *)
+            TARGET="$HOST_ARCH"
+            ;;
+    esac
+fi
+
+case "$TARGET" in
+    "arm" | "aarch64" | "arm64" | "aarch64-arm")
+        TARGET_DIR="$SCRIPT_DIR/arm"
+        ;;
+    "x86" | "x86_64" | "amd64" | "x64")
+        TARGET_DIR="$SCRIPT_DIR/x86"
+        ;;
+    *)
+        error "unsupported target: $TARGET"
+        exit 1
+        ;;
+esac
+
+if [ ! -f "$TARGET_DIR/arch.txt" ]; then
+    error "$TARGET_DIR/arch.txt not found, run make first"
+    exit 1
+fi
+
+GUEST_ARCH="$(cat "$TARGET_DIR/arch.txt")"
+
+
+debug "QEMU_ARGS_USER:" "${QEMU_ARGS_USER[@]+"${QEMU_ARGS_USER[@]}"}"
+debug "CMD_ARGS:" "${CMD_ARGS[@]+"${CMD_ARGS[@]}"}"
+debug "TARGET_DIR: $TARGET_DIR"
+debug "GUEST_ARCH: $GUEST_ARCH"
+debug "HOST_ARCH: $HOST_ARCH"
+
+TEMP_DIR="$(mktemp -d)"
+
+kvm_access_error=0
+
+case "$GUEST_ARCH" in
+    "aarch64")
+        BASE_QEMU_CMD=(
+            qemu-system-aarch64
+            -M virt
+        )
+
+        if [ "$HOST_ARCH" = "aarch64" ] && [ "$HOST_OS" = "Darwin" ]; then
+            BASE_QEMU_CMD+=(
+                -accel hvf
+                -cpu cortex-a72
+            )
+        elif [ "$HOST_ARCH" = "aarch64" ] && [ -r /dev/kvm ]; then
+            BASE_QEMU_CMD+=(
+                -accel kvm
+                -cpu cortex-a72
+            )
+        else
+            if [ "$HOST_ARCH" = "aarch64" ] && [ -e /dev/kvm ] && ! [ -r /dev/kvm ]; then
+                kvm_access_error=1
+            fi
+            BASE_QEMU_CMD+=(
+                -accel tcg
+                -cpu max
+            )
+        fi
+        KERNEL_ARGS=()
+        ;;
+    "x86_64")
+        BASE_QEMU_CMD=(
+            qemu-system-x86_64
+            -M pc
+            -nic user,model=virtio-net-pci
+        )
+        if [ "$HOST_ARCH" = "x86_64" ] && [ "$HOST_OS" = "Darwin" ]; then
+            BASE_QEMU_CMD+=(
+                -accel hvf
+                -cpu Skylake-Client
+            )
+        elif [ "$HOST_ARCH" = "x86_64" ] && [ -r /dev/kvm ]; then
+            BASE_QEMU_CMD+=(
+                -accel kvm
+                -cpu Skylake-Client
+            )
+        else
+            if [ "$HOST_ARCH" = "x86_64" ] && [ -e /dev/kvm ] && ! [ -r /dev/kvm ]; then
+                kvm_access_error=1
+            fi
+            BASE_QEMU_CMD+=(
+                -accel tcg
+                -cpu max
+            )
+        fi
+
+        KERNEL_ARGS=(
+            console=ttyS0
+        )
+        
+        ;;
+    *)
+        error "Unsupported GUEST_ARCH: $GUEST_ARCH"
+        exit 1
+        ;;
+esac
+
+if [ "$kvm_access_error" = 1 ] && [ -t 2 ]; then
+    echo "[WARNING] /dev/kvm is not accessible, run as root or add your user to the 'kvm' group, run $0 --help for more info" >&2
+fi
+
+BASE_QEMU_CMD+=(
+    -m 2048
+    -kernel "$TARGET_DIR/vmlinuz"
+    -initrd "$TARGET_DIR/initramfs"
+)
+
+QEMU_ARGS_SPINRUN=(
+    -display none
+    -no-reboot
+    -device virtio-serial-pci
+    -chardev file,id=cmd-exitcode,path=/dev/fd/4,append=on # ask qemu to forward exitcode string to fd 4
+    -device virtserialport,chardev=cmd-exitcode,name=org.spinrun.v1.exitcode
+)
+
+if [ "${XTRACE:-0}" = "1" ]; then
+    KERNEL_ARGS+=(
+        panic=3
+        loglevel=7
+        XTRACE=1
+    )
+    SERIAL_OUT=/dev/fd/2
+else
+    KERNEL_ARGS+=(
+        panic=3
+        loglevel=0
+    )
+    SERIAL_OUT=/dev/null
+fi
+
+QEMU_ARGS_SPINRUN+=(
+    -append "${KERNEL_ARGS[*]}"
+)
+
+
+stdin_tty="$(tty <&0 || true)"
+
+exec 3>&1
+stdout_tty="$(tty <&3 || true)"
+exec 3>&-
+
+stderr_tty="$(tty <&2 || true)"
+
+# We have 4 io modes:
+#
+# 1. normal_tty
+#    use it when script launched interactively (without a command), 
+#    stdin, stdout, stderr are all connected to the terminal.
+#
+#    We assume the user watching output by his eyes only, and typing input by his hands only.
+#    So we use native serial console in qemu, and guest will use normal tty device
+#    (/dev/ttyS0 or /dev/ttyAMA0)
+#
+# 2. separate_output
+#    Use it if script is launched with a command given, or if at least one of stdin, stdout,
+#    stderr is redirected. e.g.: `spinrun "echo hello" > output.txt` or 
+#    `spinrun cat -n < input.txt`
+#
+#    We need reliable data streams to and from the guest, which is not possible with serial
+#    console:
+#      - send stdin to guest, and make it not be lost while guest is booting
+#      - receive stdout and stderr from guest _separately_
+#      - make stdout and stderr buffers are not lost when guest stops
+#      - if stdin is over (got EOF), our command in guest should get EOF on it's stdin
+#      - if guest command closes stdout or stderr, we should close ours (and only the one
+#        that closed)
+#      - be sure that no special characters are mangled, like newline conversion etc
+#
+#    So we use virtio serial ports, one for each of stdin, stdout, stderr:
+#      qemu fd 0 -> guest /dev/virtio-ports/org.spinrun.v1.stdin
+#      qemu fd 1 <- guest /dev/virtio-ports/org.spinrun.v1.stdout
+#      qemu fd 2 <- guest /dev/virtio-ports/org.spinrun.v1.stderr
+#
+# 3. combined_output - same as separate_output, but when spinrun's stdout and stderr are sent 
+#    to the same pipe (i.e. redirected to the same file or terminal). So we send guest commands' stdout and stderr to the same device too
+#    (/dev/virtio-ports/org.spinrun.v1.combined-output), to make sure relative ordering of
+#    prints is preserved. i.e. if guest does "echo 2 >&2; echo 1", we should get "2" first and
+#    then "1" in our output. If we used separate streams, output order is not preserved.
+#
+# 4. plain_serial
+#    Not used here, it's for the case when vm is launched directly with QEMU, and command to
+#    run is passed as kernel command line parameter CMD.
+#    Works the same as normal_tty mode, but guest sets tty to raw mode to not convert line
+#    endings. stdout and stderr will be mixed and stdin will be lost.
+
+
+
+
+if [[ ${#CMD_ARGS[@]} -eq 0 ]] && [ -t 0 ] && [ -t 1 ] && [ -t 2 ] && [ "$stdin_tty" = "$stdout_tty" ] && [ "$stdout_tty" = "$stderr_tty" ]; then
+    debug "io_mode: normal_tty"
+    QEMU_ARGS_SPINRUN+=(
+        -chardev "stdio,id=char0,signal=off,logfile=/dev/fd/5" # save console log to fd 5
+        -serial chardev:char0
+        -fw_cfg "name=opt/org.spinrun.v1.io_mode,string=normal_tty"
+    )
+elif [ -e /dev/fd/1 ] && [ -e /dev/fd/2 ] && [ /dev/fd/1 -ef /dev/fd/2 ]; then
+    debug "io_mode: combined_output"
+    QEMU_ARGS_SPINRUN+=(
+        -chardev "file,id=char0,path=$SERIAL_OUT,logfile=/dev/fd/5" # save console log to fd 5
+        -serial chardev:char0
+        -fw_cfg "name=opt/org.spinrun.v1.io_mode,string=combined_output"
+
+        -chardev file,id=cmd-stdin,path=/dev/null,input-path=/dev/fd/0 # supported since qemu v8.1.0
+
+        -device virtserialport,chardev=cmd-stdin,name=org.spinrun.v1.stdin
+        -chardev file,id=cmd-combined-output,path=/dev/fd/1,append=on
+        -device virtserialport,chardev=cmd-combined-output,name=org.spinrun.v1.combined-output
+    )
+else
+    debug "io_mode: separate_output"
+    QEMU_ARGS_SPINRUN+=(
+        -chardev "file,id=char0,path=$SERIAL_OUT,logfile=/dev/fd/5" # save console log to fd 5
+        -serial chardev:char0
+        -fw_cfg "name=opt/org.spinrun.v1.io_mode,string=separate_output"
+
+        -chardev file,id=cmd-stdin,path=/dev/null,input-path=/dev/fd/0 
+
+        -device virtserialport,chardev=cmd-stdin,name=org.spinrun.v1.stdin
+        -chardev file,id=cmd-stdout,path=/dev/fd/1,append=true -device virtserialport,chardev=cmd-stdout,name=org.spinrun.v1.stdout
+        -chardev file,id=cmd-stderr,path=/dev/fd/2,append=true -device virtserialport,chardev=cmd-stderr,name=org.spinrun.v1.stderr
+    )
+fi
+
+
+if [[ ${#CMD_ARGS[@]} -gt 0 ]]; then
+    if [[ ${#CMD_ARGS[@]} -eq 1 ]]; then
+        cmd_to_run="${CMD_ARGS[0]}"
+    else
+        cmd_to_run="$(printf "%q " "${CMD_ARGS[@]}")"
+        cmd_to_run="${cmd_to_run% }"
+    fi
+
+    QEMU_ARGS_SPINRUN+=(
+        -fw_cfg "name=opt/org.spinrun.v1.cmd,string=${cmd_to_run//,/,,}"
+    )
+
+fi
+
+QEMU_CMD=("${BASE_QEMU_CMD[@]}" "${QEMU_ARGS_SPINRUN[@]}" ${QEMU_ARGS_USER[@]+"${QEMU_ARGS_USER[@]}"})
+
+{
+exitcode="$(
+{
+    {
+        # QEMU sets O_NONBLOCK on its file descriptors. When output is to terminal, this causes issues and leads to lost output.
+        # Passing stdout and stderr through cat to prevent this.
+        
+        # first stderr, keeping stdout in fd 11
+        # after cat send stderr to fd 2 where is should go
+        "${QEMU_CMD[@]}" 2>&1 1>&11 |cat >&2
+
+    # then stdout, recover it from fd 11, pass through cat and send to fd 11 again
+    } 11>&1 | cat >&11
+
+# we need to save the exit code from the guest, it is on fd 4, so redirect it to fd 1 and capture to exitcode var
+# for this to work we moved stdout to fd 11 again above, to not mix with exitcode here
+} 4>&1
+)"
+
+# exitcode captured, now recover stdout from fd 11 to fd 1 where it should be
+# and save vm console log from fd 5 to a file
+} 11>&1 5>"${TEMP_DIR}/console.log"
+
+quote_cmd() {
+    (set -x; : "$@") 2>&1 | sed -n 's/^+* : //p'
+}
+
+debug "exitcode: $exitcode"
+if [ -z "$exitcode" ]; then
+    set +x
+    error "exitcode not received from guest"
+    error "console log is at ${TEMP_DIR}/console.log"
+    error "qemu command used:"
+    echo "$(quote_cmd "${QEMU_CMD[@]}") 5>/tmp/console.log 4>/tmp/exitcode.txt" >&2
+    exit 127
+fi
+
+rm -rf "$TEMP_DIR"
+exit "$exitcode"
+

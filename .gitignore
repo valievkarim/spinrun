@@ -1,0 +1,15 @@
+*~
+\#*#
+.#*
+.DS_Store
+/.idea/
+/.vscode/
+
+/dl/
+/tmp/
+/arm/initramfs
+/arm/vmlinuz
+/x86/initramfs
+/x86/vmlinuz
+/arm/arch.txt
+/x86/arch.txt

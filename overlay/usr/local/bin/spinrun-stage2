@@ -1,0 +1,140 @@
+#!/bin/sh
+set -o errexit -o nounset -o pipefail
+[ "${XTRACE:-0}" = "1" ] && set -o xtrace
+
+debug() { :; }
+
+io_mode="normal_tty"
+
+if [ -n "${CMD:-}" ]; then
+    cmd="$CMD"
+    io_mode="plain_serial"
+elif [ -e "/sys/firmware/qemu_fw_cfg/by_name/opt/org.spinrun.v1.cmd/raw" ]; then
+    cmd="$(cat /sys/firmware/qemu_fw_cfg/by_name/opt/org.spinrun.v1.cmd/raw)"
+else
+    cmd="sh"
+fi
+
+if [ -e "/sys/firmware/qemu_fw_cfg/by_name/opt/org.spinrun.v1.io_mode/raw" ]; then
+    io_mode="$(cat /sys/firmware/qemu_fw_cfg/by_name/opt/org.spinrun.v1.io_mode/raw)"
+fi
+
+SH_OPTS=""
+if [ "${XTRACE:-0}" = "1" ]; then
+    SH_OPTS="-x"
+fi
+
+export HOME=/root
+cd /root
+
+active_console="/dev/$(grep -oE 'tty(S|AMA|USB|hvc)[0-9]+' /sys/class/tty/console/active | head -n1 || echo console)"
+
+debug "io_mode: $io_mode"
+debug "cmd: $cmd"
+debug "active_console: $active_console"
+
+# see io_mode descriptions in code comments in `spinrun`
+case "$io_mode" in
+    plain_serial)
+        stty raw -echo -onlcr -isig -icanon -iexten -icrnl -ixon -ixoff < "$active_console"
+
+        ret=0
+        sh $SH_OPTS -c "$cmd" < "$active_console" > "$active_console" 2>&1 || ret=$?
+        if [ -e /dev/virtio-ports/org.spinrun.v1.exitcode ]; then
+            echo $ret > /dev/virtio-ports/org.spinrun.v1.exitcode
+        fi
+        ;;
+
+    normal_tty)
+        eval "$(resize)" < "$active_console" > "$active_console" 2>&1
+        ret=0
+        sh $SH_OPTS -c "$cmd" < "$active_console" > "$active_console" 2>&1 || ret=$?
+        if [ -e /dev/virtio-ports/org.spinrun.v1.exitcode ]; then
+            echo $ret > /dev/virtio-ports/org.spinrun.v1.exitcode
+        fi
+        ;;
+
+    separate_output)
+
+        # We need to pass stdin, stdout and stderr through cat, so that cmd will see
+        # /proc/self/fd/{0,1,2} as anonymous pipes, not as device symlinks. Otherwise if
+        # running command does something like `echo err >/dev/stderr`, it will try to
+        # reopen virtio port device and get an error.
+
+        fifo="$(mktemp -u)"
+        mkfifo "$fifo"
+        
+        # Stdin needed to be read in background, so that if cmd exits before stdin is over,
+        # we ignore what's left there and don't wait for it to close.
+        
+        # First send stdin to fifo:
+        cat < /dev/virtio-ports/org.spinrun.v1.stdin > "$fifo" &
+        cat_pid=$!
+
+        # Open fifo as fd 7 and then delete it, just to not clutter /tmp/ for our command.
+        # Could open it as fd 0, but want to make sure that after command exits, the
+        # following code will not interfere with that fifo/device
+        exec 7< "$fifo"
+        rm "$fifo"
+        {
+            # One more cat for stdin, so that cmd will see it as anonymous pipe and not
+            # named fifo, just for consistency
+            cat <&7 | (
+
+                # Stdin is duped to fd 0 now, close fd 7 to not leak it to the command
+                exec 7<&-
+                ret=0
+                sh $SH_OPTS -c "$cmd"|| ret=$? 
+
+                # Command done, stdin is not interesting anymore, kill the background cat.
+                # Could consume something not intended for cmd, then it's lost, can do
+                # nothing about it (run spinrun with '< /dev/null' to make it not consume
+                # stdin if need it later)
+                kill $cat_pid 2>/dev/null || true
+                wait $cat_pid 2>/dev/null || true
+
+                echo "$ret" > /dev/virtio-ports/org.spinrun.v1.exitcode
+
+            # Send stdout to virtio port through cat, so that cmd sees anonymous pipe and
+            # not device symlink (so it can be reopened). This cat is run synchronously,
+            # so that when cmd exits, cat runs till all output is sent to virtio port
+            ) | cat > /dev/virtio-ports/org.spinrun.v1.stdout
+
+        # Same for stderr as for stdout  
+        } 2>&1 | cat > /dev/virtio-ports/org.spinrun.v1.stderr
+
+        # We have closed fd 7 in subshell, but here in parent shell it's still open,
+        # so close it
+        exec 7<&-
+        ;;
+
+    combined_output)
+    
+        fifo=$(mktemp -u)
+        mkfifo "$fifo"
+        
+        # Same as above, async (background) cat for stdin first to fifo and second cat to
+        # anonymous pipe. Synchronous cat for stdout and stderr - single one for both, cmd
+        # will see single anonymous pipe.
+        cat < /dev/virtio-ports/org.spinrun.v1.stdin > "$fifo" &
+        cat_pid=$!
+        exec 7< "$fifo"
+        rm "$fifo"
+        cat <&7 | (
+            exec 7<&-
+            ret=0
+            sh $SH_OPTS -c "$cmd" 2>&1 || ret=$?
+            kill $cat_pid 2>/dev/null || true
+            wait $cat_pid 2>/dev/null || true
+            echo "$ret" > /dev/virtio-ports/org.spinrun.v1.exitcode
+        ) | cat > /dev/virtio-ports/org.spinrun.v1.combined-output
+        exec 7<&-
+        ;;
+
+    *)
+        echo "unknown io_mode: $io_mode" >&2
+        ;;
+esac
+
+sync
+poweroff -f

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -o nounset -o errexit -o pipefail
+[ "${XTRACE:-0}" = "1" ] && set -o xtrace
+
+/usr/local/bin/spinrun-stage1 || { echo "init failed" >&2; poweroff -f; }

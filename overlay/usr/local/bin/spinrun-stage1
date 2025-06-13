@@ -1,0 +1,49 @@
+#!/bin/sh
+set -o nounset -o errexit -o pipefail
+[ "${XTRACE:-0}" = "1" ] && set -o xtrace
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+mkdir -p /dev/shm
+
+ln -sf /proc/self/fd /dev/fd
+ln -sf /proc/self/fd/0 /dev/stdin
+ln -sf /proc/self/fd/1 /dev/stdout
+ln -sf /proc/self/fd/2 /dev/stderr
+
+mount -t cgroup2 none /sys/fs/cgroup
+modprobe virtio_pci
+modprobe virtio_net
+modprobe virtio_blk
+modprobe virtio_scsi
+modprobe qemu_fw_cfg
+
+mdev -s -f
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export TERM=xterm-256color
+
+if ip link show eth0 >/dev/null 2>&1; then
+    ip link set eth0 up
+    ip addr add 10.0.2.20/24 dev eth0
+    ip route add default via 10.0.2.2
+    echo "nameserver 10.0.2.3" >/etc/resolv.conf
+fi
+
+mem_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+size_to_use=$((mem_kb - 200 * 1024))
+mount -o remount,"size=${size_to_use}k" /
+
+exec unshare --mount sh -c '
+[ "${XTRACE:-0}" = "1" ] && set -o xtrace
+
+mkdir -p /mnt/chroot-mnt
+mount --rbind / /mnt/chroot-mnt --mkdir
+cd /mnt/chroot-mnt
+mount --move . /
+rm -rf /mnt/chroot-mnt
+exec chroot . setsid /usr/local/bin/spinrun-stage2
+'
